@@ -188,6 +188,8 @@ activity-aggregate-updater:
       consumption.table = "{{ middleware_consumption_table }}"
       user_activity_agg.table = "{{ middleware_user_activity_agg_table }}"
       user_enrolments.table = "user_enrolments"
+      hierarchy.keyspace = "{{ middleware_hierarchy_keyspace }}"
+      content_hierarchy.table = "{{ middleware_content_hierarchy_table }}"
     }
     redis {
       database {

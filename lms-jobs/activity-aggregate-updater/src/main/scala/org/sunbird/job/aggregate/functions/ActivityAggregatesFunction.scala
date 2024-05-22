@@ -4,11 +4,13 @@ import java.lang.reflect.Type
 import java.util.concurrent.TimeUnit
 import com.datastax.driver.core.Row
 import com.datastax.driver.core.querybuilder.{QueryBuilder, Select, Update}
+import com.fasterxml.jackson.core.JsonParser.Feature
+import com.fasterxml.jackson.databind.{DeserializationFeature, ObjectMapper}
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import com.twitter.storehaus.cache.TTLCache
 import com.twitter.util.Duration
-import org.apache.commons.collections.CollectionUtils
+import org.apache.commons.collections.{CollectionUtils, MapUtils}
 import org.apache.commons.lang3.StringUtils
 import org.apache.flink.api.common.typeinfo.TypeInformation
 import org.apache.flink.configuration.Configuration
@@ -22,7 +24,6 @@ import org.sunbird.job.util.{CassandraUtil, HttpUtil}
 import org.sunbird.job.{Metrics, WindowBaseProcessFunction}
 
 import scala.collection.JavaConverters._
-import scala.collection.mutable.ListBuffer
 
 class ActivityAggregatesFunction(config: ActivityAggregateUpdaterConfig, httpUtil: HttpUtil, @transient var cassandraUtil: CassandraUtil = null)
                                 (implicit val stringTypeInfo: TypeInformation[String])
@@ -33,6 +34,7 @@ class ActivityAggregatesFunction(config: ActivityAggregateUpdaterConfig, httpUti
   private var cache: DataCache = _
   private var collectionStatusCache: TTLCache[String, String] = _
   lazy private val gson = new Gson()
+  lazy private val mapper: ObjectMapper = new ObjectMapper()
 
   override def metricsList(): List[String] = {
     List(config.failedEventCount, config.dbUpdateCount, config.dbReadCount, config.cacheHitCount, config.cacheMissCount, config.processedEnrolmentCount, config.retiredCCEventsCount)
@@ -127,8 +129,21 @@ class ActivityAggregatesFunction(config: ActivityAggregateUpdaterConfig, httpUti
     val contextId = "cb:" + userConsumption.batchId
     val key = s"$courseId:$courseId:${config.leafNodes}"
 
-    val leafNodes = readFromCache(key, metrics).distinct
+    //var leafNodes = readFromCache(key, metrics).distinct
+    var leafNodes:List[String] = List()
     logger.info(s"leaf nodes : $leafNodes")
+
+    if(leafNodes.isEmpty){
+      val hierarchy = getHierarchy(courseId)(metrics)
+      logger.info("hierarchy :: " + hierarchy)
+      if (MapUtils.isNotEmpty(hierarchy)) {
+        val leafNodesMap = getLeafNodes(courseId, hierarchy)
+        logger.info("Leaf-nodes size: " + leafNodesMap.size)
+        logger.info("Leaf-nodes keys: " + leafNodesMap.keySet)
+        leafNodes = leafNodesMap.get(courseId).asInstanceOf[List[String]]
+      }
+    }
+    logger.info("Leaf-nodes: " + leafNodes)
 
     if (leafNodes.isEmpty) {
       logger.info(s"leaf nodes are not available for: $key")
@@ -161,6 +176,69 @@ class ActivityAggregatesFunction(config: ActivityAggregateUpdaterConfig, httpUti
       Option(UserEnrolmentAgg(UserActivityAgg("Course", userId, courseId, contextId, Map("completedCount" -> completedCount.toDouble), Map("completedCount" -> System.currentTimeMillis())), collectionProgress))
     }
   }
+
+  //------
+
+  private def getLeafNodes(identifier: String, hierarchy: java.util.Map[String, AnyRef]): Map[String, List[String]] = {
+    val mimeType = hierarchy.getOrDefault("mimeType", "").asInstanceOf[String]
+    val leafNodesMap = if (StringUtils.equalsIgnoreCase(mimeType, "application/vnd.ekstep.content-collection")) {
+      val leafNodes = getOrComposeLeafNodes(hierarchy, false)
+      val map: Map[String, List[String]] = if (leafNodes.nonEmpty) Map() + (identifier -> leafNodes) else Map()
+      val children = getChildren(hierarchy)
+      val childLeafNodesMap = if (CollectionUtils.isNotEmpty(children)) {
+        children.asScala.map(child => {
+          val childId = child.get("identifier").asInstanceOf[String]
+          getLeafNodes(childId, child)
+        }).flatten.toMap
+      } else Map()
+      map ++ childLeafNodesMap
+    } else Map()
+    leafNodesMap.filter(m => m._2.nonEmpty).toMap
+  }
+
+  private def getOrComposeLeafNodes(hierarchy: java.util.Map[String, AnyRef], compose: Boolean = true): List[String] = {
+    if (hierarchy.containsKey("leafNodes") && !compose)
+      hierarchy.getOrDefault("leafNodes", java.util.Arrays.asList()).asInstanceOf[java.util.List[String]].asScala.toList
+    else {
+      val children = getChildren(hierarchy)
+      val childCollections = children.asScala.filter(c => isCollection(c))
+      val leafList = childCollections.map(coll => getOrComposeLeafNodes(coll, true)).flatten.toList
+      val ids = children.asScala.filterNot(c => isCollection(c)).map(c => c.getOrDefault("identifier", "").asInstanceOf[String]).filter(id => StringUtils.isNotBlank(id))
+      leafList ++ ids
+    }
+  }
+
+  private def getChildren(hierarchy: java.util.Map[String, AnyRef]) = {
+    val children = hierarchy.getOrDefault("children", java.util.Arrays.asList()).asInstanceOf[java.util.List[java.util.Map[String, AnyRef]]]
+    if (CollectionUtils.isEmpty(children)) List().asJava else children
+  }
+
+  private def isCollection(content: java.util.Map[String, AnyRef]): Boolean = {
+    StringUtils.equalsIgnoreCase(content.getOrDefault("mimeType", "").asInstanceOf[String], "application/vnd.ekstep.content-collection")
+  }
+
+  private def getHierarchy(identifier: String)(implicit metrics: Metrics): java.util.Map[String, AnyRef] = {
+    val hierarchy = readHierarchyFromDb(identifier)
+
+    metrics.incCounter(config.dbReadCount)
+    mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+    mapper.configure(Feature.ALLOW_BACKSLASH_ESCAPING_ANY_CHARACTER, true)
+    if (StringUtils.isNotBlank(hierarchy))
+      mapper.readValue(hierarchy, classOf[java.util.Map[String, AnyRef]])
+    else new java.util.HashMap[String, AnyRef]()
+  }
+
+  def readHierarchyFromDb(identifier: String): String = {
+    val columnName = "hierarchy"
+    val selectQuery = QueryBuilder.select().column(columnName).from(config.dbHierarchyKeyspace, config.dbContentHierarchyTable)
+    selectQuery.where.and(QueryBuilder.eq(config.hierarchyPrimaryKey.head, identifier))
+    val rows = cassandraUtil.find(selectQuery.toString)
+    if (CollectionUtils.isNotEmpty(rows))
+      rows.asScala.head.getObject("hierarchy").asInstanceOf[String]
+    else
+      ""
+  }
+  //------
 
   /**
    * Identified the children of the course (only collections) for which aggregates computation required.

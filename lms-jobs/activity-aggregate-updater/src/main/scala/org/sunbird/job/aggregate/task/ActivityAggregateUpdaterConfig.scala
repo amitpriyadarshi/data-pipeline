@@ -50,6 +50,9 @@ class ActivityAggregateUpdaterConfig(override val config: Config) extends BaseJo
   val dbKeyspace: String = config.getString("lms-cassandra.keyspace")
   val dbHost: String = config.getString("lms-cassandra.host")
   val dbPort: Int = config.getInt("lms-cassandra.port")
+  val dbHierarchyKeyspace: String = config.getString("lms-cassandra.hierarchy.keyspace")
+  val dbContentHierarchyTable: String = config.getString("lms-cassandra.content_hierarchy.table")
+  val hierarchyPrimaryKey: List[String] = List("identifier")
 
   // Redis Configurations
   val nodeStore: Int = config.getInt("redis.database.relationCache.id") // Both LeafNodes And Ancestor nodes
